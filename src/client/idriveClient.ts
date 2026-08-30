@@ -131,11 +131,17 @@ export class EvsBootstrapError extends Error {
  * Thrown by {@link IdriveClient.downloadEvsToFile} when the EVS host
  * returned a non-2xx HTTP status for a download attempt, or when the
  * post-retry attempt (after invalidating a stale `EVSID`, see
- * {@link isInvalidEvsidResponse}) still looks like the "stale EVSID" error
- * shape — meaning a fresh `EVSID` didn't fix it, so retrying again wouldn't
- * help either. Distinct from {@link EvsBootstrapError}: that one fires
- * during the `EVSID` handshake itself, before any download attempt; this one
- * fires on the download request that uses an already-bootstrapped `EVSID`.
+ * {@link isInvalidEvsidResponse}) still doesn't look like real file content —
+ * either because it still looks like the "stale EVSID" error shape (meaning
+ * a fresh `EVSID` didn't fix it, so retrying again wouldn't help either), or
+ * because it looks like an HTML document (see {@link looksLikeHtmlResponse}):
+ * a confirmed EVS-host behavior where a `path` that doesn't actually resolve
+ * to a real file/folder for the device gets served the host's own public
+ * marketing homepage instead of a clean error, rather than the two cases
+ * being distinguishable from the HTTP status alone. Distinct from
+ * {@link EvsBootstrapError}: that one fires during the `EVSID` handshake
+ * itself, before any download attempt; this one fires on the download
+ * request that uses an already-bootstrapped `EVSID`.
  *
  * @example
  * ```ts
@@ -364,6 +370,40 @@ function looksLikeInvalidEvsidResponse(data: Buffer): boolean {
 }
 
 /**
+ * Sniffs whether a response body is actually an HTML document rather than
+ * real file content, from just its leading peeked bytes — catches a
+ * confirmed iDrive EVS-host failure mode where `evs/downloadFile` is asked to
+ * download a `path` that doesn't resolve to a real file/folder for the
+ * device, and instead of a clean error the host returns a 200 whose body is
+ * its own public marketing homepage (`<!DOCTYPE html>...<title>Online Backup
+ * for PC, Mac and iPhone | IDrive</title>...`, confirmed ~34KB in the wild).
+ * Unlike {@link looksLikeInvalidEvsidResponse}, this does NOT require the
+ * whole body to fit within the peek window: an HTML document's
+ * `<!doctype html`/`<html` opening tag always appears in its first few dozen
+ * bytes regardless of overall document length, so checking only the peeked
+ * prefix is enough even for a body many times larger than the peek window.
+ *
+ * @param data the leading bytes of the response body (as already
+ *   accumulated by {@link peekAndStreamResponseToFile}'s peek loop — this
+ *   function never reads further itself).
+ * @returns `true` when, after trimming leading whitespace, `data` starts
+ *   (case-insensitively) with `<!doctype html` or `<html`.
+ * @example
+ * ```ts
+ * looksLikeHtmlResponse(Buffer.from("<!DOCTYPE html><html><head><title>Online Backup...")); // => true
+ * looksLikeHtmlResponse(Buffer.from("PK\x03\x04...binary zip bytes...")); // => false
+ * ```
+ */
+function looksLikeHtmlResponse(data: Buffer): boolean {
+  const prefix = data
+    .subarray(0, INVALID_EVSID_PEEK_BYTES)
+    .toString("utf8")
+    .trimStart()
+    .toLowerCase();
+  return prefix.startsWith("<!doctype html") || prefix.startsWith("<html");
+}
+
+/**
  * Reads a raw `fetch` `Response` body far enough to tell whether it's
  * iDrive's small "stale EVSID" JSON error envelope (see
  * {@link looksLikeInvalidEvsidResponse}) or genuine file content, without
@@ -374,19 +414,25 @@ function looksLikeInvalidEvsidResponse(data: Buffer): boolean {
  * response (see `src/tools/files.test.ts`'s `node:http`-backed streaming
  * tests), mirroring the way {@link parseGetNewServerResponse} is exported
  * purely for testability. Peeks up to {@link INVALID_EVSID_PEEK_BYTES} bytes
- * of the body: if it ends within that many bytes and matches the error
- * shape, nothing is written to disk and the caller can safely retry.
- * Otherwise, the already-peeked bytes are written to `destinationPath`
- * first, then the rest of the body is piped to the same file — so a real
- * response, however large, is never fully buffered in memory.
+ * of the body: if it ends within that many bytes and matches the stale-EVSID
+ * error shape, nothing is written to disk and the caller can safely retry.
+ * Independently, if the peeked prefix looks like an HTML document (see
+ * {@link looksLikeHtmlResponse} — covers a confirmed EVS-host failure mode
+ * where a non-resolving `path` gets served the public marketing homepage
+ * instead of a clean error), nothing is written either, regardless of how
+ * large the full body turns out to be. Otherwise, the already-peeked bytes
+ * are written to `destinationPath` first, then the rest of the body is piped
+ * to the same file — so a real response, however large, is never fully
+ * buffered in memory.
  *
  * @param response a `fetch` `Response` whose body hasn't been read yet.
  * @param destinationPath the absolute local file path to stream real content
  *   to; its parent directory is created if it doesn't already exist.
  * @returns `{ kind: "invalid-evsid" }` if the body matched the stale-EVSID
- *   error shape (no file was written), or `{ kind: "downloaded",
- *   bytesWritten }` with the total number of bytes written to
- *   `destinationPath`.
+ *   error shape, `{ kind: "unexpected-html" }` if the body looked like an
+ *   HTML document (in both cases no file was written), or
+ *   `{ kind: "downloaded", bytesWritten }` with the total number of bytes
+ *   written to `destinationPath`.
  * @throws {DestinationWriteError} if creating `destinationPath`'s parent
  *   directory, opening it for writing, or writing to it fails.
  * @example
@@ -401,7 +447,7 @@ function looksLikeInvalidEvsidResponse(data: Buffer): boolean {
 export async function peekAndStreamResponseToFile(
   response: Response,
   destinationPath: string,
-): Promise<{ kind: "invalid-evsid" } | { kind: "downloaded"; bytesWritten: number }> {
+): Promise<{ kind: "invalid-evsid" } | { kind: "unexpected-html" } | { kind: "downloaded"; bytesWritten: number }> {
   const reader = response.body === null ? null : response.body.getReader();
 
   const peekedChunks: Uint8Array[] = [];
@@ -418,8 +464,13 @@ export async function peekAndStreamResponseToFile(
     peekedBytes += next.value.byteLength;
   }
 
-  if (streamEnded && looksLikeInvalidEvsidResponse(Buffer.concat(peekedChunks))) {
+  const peekedBuffer = Buffer.concat(peekedChunks);
+  if (streamEnded && looksLikeInvalidEvsidResponse(peekedBuffer)) {
     return { kind: "invalid-evsid" };
+  }
+
+  if (looksLikeHtmlResponse(peekedBuffer)) {
+    return { kind: "unexpected-html" };
   }
 
   let bytesWritten = 0;
@@ -895,7 +946,7 @@ export class IdriveClient {
     path: string,
     params: URLSearchParams,
     destinationPath: string,
-  ): Promise<{ kind: "invalid-evsid" } | { kind: "downloaded"; bytesWritten: number }> {
+  ): Promise<{ kind: "invalid-evsid" } | { kind: "unexpected-html" } | { kind: "downloaded"; bytesWritten: number }> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
 
@@ -945,7 +996,9 @@ export class IdriveClient {
    *   `EVSID` was usable.
    * @throws {EvsDownloadHttpError} if either attempt's response status
    *   wasn't 2xx, or the retry attempt (after minting a fresh `EVSID`) still
-   *   looked like the stale-EVSID error shape.
+   *   looked like the stale-EVSID error shape or looked like an HTML
+   *   document (see {@link looksLikeHtmlResponse} — a confirmed EVS-host
+   *   behavior when `path` doesn't resolve to a real file/folder).
    * @throws {EvsDownloadTimeoutError} if an attempt didn't finish within the
    *   configured timeout.
    * @throws {DestinationWriteError} if writing to `destinationPath` failed
@@ -979,7 +1032,37 @@ export class IdriveClient {
       return retryAttempt.bytesWritten;
     }
 
-    throw new EvsDownloadHttpError(
+    throw this.buildFinalDownloadError(retryAttempt);
+  }
+
+  /**
+   * Builds the final {@link EvsDownloadHttpError} {@link downloadEvsToFile}
+   * throws when both the first attempt and the post-invalidation retry come
+   * back as something other than `"downloaded"` — exists so the thrown
+   * message actually differs by which non-`"downloaded"` outcome the retry
+   * hit, instead of a single fixed "stale EVSID" message that would mislead
+   * a caller in the `"unexpected-html"` case (which isn't a session-staleness
+   * problem at all, see {@link looksLikeHtmlResponse}).
+   *
+   * @param retryResult the retry attempt's result, already confirmed to not
+   *   be `{ kind: "downloaded" }`.
+   * @returns an {@link EvsDownloadHttpError} with a message tailored to
+   *   `retryResult.kind`.
+   */
+  private buildFinalDownloadError(
+    retryResult: { kind: "invalid-evsid" } | { kind: "unexpected-html" },
+  ): EvsDownloadHttpError {
+    if (retryResult.kind === "unexpected-html") {
+      return new EvsDownloadHttpError(
+        "the response looked like an HTML page rather than real file content, after minting a fresh EVSID " +
+          "and retrying once. This is a known iDrive behavior: the EVS host serves its public marketing " +
+          "homepage instead of a clean error when the requested path doesn't actually resolve to a real " +
+          "file/folder for this device. Re-verify the path with browse_folder/list_files rather than " +
+          "assume the session is stale.",
+      );
+    }
+
+    return new EvsDownloadHttpError(
       "the response still looked like the stale-EVSID error shape after minting a fresh EVSID and retrying once.",
     );
   }
