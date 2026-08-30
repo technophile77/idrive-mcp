@@ -1,6 +1,32 @@
+import { createWriteStream } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { extractAccountEmail, extractEvsServerHost, isSessionExpired } from "./session.js";
 
 const IDRIVE_ORIGIN = "https://www.idrive.com";
+
+/**
+ * How long a single `downloadEvsToFile` attempt (bootstrap-and-retry counts
+ * as up to two attempts, see {@link IdriveClient.downloadEvsToFile}) is
+ * allowed to run before it's aborted as hung, in milliseconds. Generous on
+ * purpose — this exists only to fail a genuinely stalled connection, not to
+ * cap normal large-file transfer time (10 minutes comfortably covers
+ * multi-GB files at modest throughput).
+ */
+const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
+/**
+ * Number of leading bytes of an `/evs/*` raw response peeked at before
+ * deciding whether it's iDrive's small "stale EVSID" JSON error envelope
+ * (`{"message":"ERROR","desc":"INVALID PARAMETERS"}`, see
+ * {@link looksLikeInvalidEvsidResponse}) or real payload content. Shared by
+ * {@link looksLikeInvalidEvsidResponse} (whole-buffer case) and
+ * {@link peekAndStreamResponseToFile} (streaming case) so both apply the
+ * exact same threshold rather than two magic numbers drifting apart.
+ */
+const INVALID_EVSID_PEEK_BYTES = 256;
 
 /** `Referer` header value used for calls to a per-account EVS satellite host, distinct from the idriveent console's `Referer` (see `docs/api-map.md`'s "Second app surface" section). */
 const EVS_REFERER = "https://www.idrive.com/";
@@ -98,6 +124,88 @@ export class EvsBootstrapError extends Error {
         'EVS session is actually established" section.',
     );
     this.name = "EvsBootstrapError";
+  }
+}
+
+/**
+ * Thrown by {@link IdriveClient.downloadEvsToFile} when the EVS host
+ * returned a non-2xx HTTP status for a download attempt, or when the
+ * post-retry attempt (after invalidating a stale `EVSID`, see
+ * {@link isInvalidEvsidResponse}) still looks like the "stale EVSID" error
+ * shape — meaning a fresh `EVSID` didn't fix it, so retrying again wouldn't
+ * help either. Distinct from {@link EvsBootstrapError}: that one fires
+ * during the `EVSID` handshake itself, before any download attempt; this one
+ * fires on the download request that uses an already-bootstrapped `EVSID`.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.downloadEvsToFile("/evs/downloadFile", { p: "/C/big.zip", json: "yes", device_id: "D01" }, "C:\\out\\big.zip");
+ * } catch (err) {
+ *   if (err instanceof EvsDownloadHttpError) {
+ *     console.error(err.message); // explains the HTTP status or the still-stale-EVSID retry outcome
+ *   }
+ * }
+ * ```
+ */
+export class EvsDownloadHttpError extends Error {
+  constructor(reason: string) {
+    super(`evs/downloadFile request failed: ${reason}`);
+    this.name = "EvsDownloadHttpError";
+  }
+}
+
+/**
+ * Thrown by {@link IdriveClient.downloadEvsToFile} when a download attempt
+ * didn't finish within {@link DOWNLOAD_TIMEOUT_MS}, so a genuinely hung
+ * connection fails cleanly instead of leaving the caller waiting forever.
+ * Not expected in normal use — large files are still allowed to take a long
+ * time, this only fires when a connection stalls completely.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.downloadEvsToFile("/evs/downloadFile", { p: "/C/big.zip", json: "yes", device_id: "D01" }, "C:\\out\\big.zip");
+ * } catch (err) {
+ *   if (err instanceof EvsDownloadTimeoutError) {
+ *     console.error(err.message); // tells the user the connection appears to have stalled
+ *   }
+ * }
+ * ```
+ */
+export class EvsDownloadTimeoutError extends Error {
+  constructor() {
+    super(
+      `evs/downloadFile did not complete within ${DOWNLOAD_TIMEOUT_MS / 1000}s and was aborted as hung. ` +
+        "This is unusual even for large files — check network connectivity and try again.",
+    );
+    this.name = "EvsDownloadTimeoutError";
+  }
+}
+
+/**
+ * Thrown by {@link IdriveClient.downloadEvsToFile} when writing the
+ * downloaded bytes to `destinationPath` fails locally — e.g. the parent
+ * directory couldn't be created, the process lacks write permission, or the
+ * disk is full. Distinct from {@link EvsDownloadHttpError}: this means the
+ * download itself was fine but saving it locally wasn't, so the fix is on
+ * the caller's filesystem side, not iDrive's.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await client.downloadEvsToFile("/evs/downloadFile", { p: "/C/big.zip", json: "yes", device_id: "D01" }, "C:\\out\\big.zip");
+ * } catch (err) {
+ *   if (err instanceof DestinationWriteError) {
+ *     console.error(err.message); // explains which local write step failed
+ *   }
+ * }
+ * ```
+ */
+export class DestinationWriteError extends Error {
+  constructor(destinationPath: string, reason: string) {
+    super(`Could not write the downloaded file to "${destinationPath}": ${reason}`);
+    this.name = "DestinationWriteError";
   }
 }
 
@@ -244,7 +352,7 @@ function isInvalidEvsidResponse(body: unknown): boolean {
  *   response and decodes to that exact JSON shape.
  */
 function looksLikeInvalidEvsidResponse(data: Buffer): boolean {
-  if (data.byteLength > 256) {
+  if (data.byteLength > INVALID_EVSID_PEEK_BYTES) {
     return false;
   }
 
@@ -253,6 +361,94 @@ function looksLikeInvalidEvsidResponse(data: Buffer): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Reads a raw `fetch` `Response` body far enough to tell whether it's
+ * iDrive's small "stale EVSID" JSON error envelope (see
+ * {@link looksLikeInvalidEvsidResponse}) or genuine file content, without
+ * ever buffering a large response in full — the core of
+ * {@link IdriveClient.downloadEvsToFile}'s peek-then-stream strategy, kept as
+ * a standalone function decoupled from any EVSID/cookie/host bootstrap
+ * concerns so it can be unit-tested directly against a real `fetch()`
+ * response (see `src/tools/files.test.ts`'s `node:http`-backed streaming
+ * tests), mirroring the way {@link parseGetNewServerResponse} is exported
+ * purely for testability. Peeks up to {@link INVALID_EVSID_PEEK_BYTES} bytes
+ * of the body: if it ends within that many bytes and matches the error
+ * shape, nothing is written to disk and the caller can safely retry.
+ * Otherwise, the already-peeked bytes are written to `destinationPath`
+ * first, then the rest of the body is piped to the same file — so a real
+ * response, however large, is never fully buffered in memory.
+ *
+ * @param response a `fetch` `Response` whose body hasn't been read yet.
+ * @param destinationPath the absolute local file path to stream real content
+ *   to; its parent directory is created if it doesn't already exist.
+ * @returns `{ kind: "invalid-evsid" }` if the body matched the stale-EVSID
+ *   error shape (no file was written), or `{ kind: "downloaded",
+ *   bytesWritten }` with the total number of bytes written to
+ *   `destinationPath`.
+ * @throws {DestinationWriteError} if creating `destinationPath`'s parent
+ *   directory, opening it for writing, or writing to it fails.
+ * @example
+ * ```ts
+ * const response = await fetch("https://evsweb5187.idrive.com/evs/downloadFile", { method: "POST", body: params });
+ * const result = await peekAndStreamResponseToFile(response, "C:\\out\\big.zip");
+ * if (result.kind === "downloaded") {
+ *   console.log(result.bytesWritten); // e.g. 20971520
+ * }
+ * ```
+ */
+export async function peekAndStreamResponseToFile(
+  response: Response,
+  destinationPath: string,
+): Promise<{ kind: "invalid-evsid" } | { kind: "downloaded"; bytesWritten: number }> {
+  const reader = response.body === null ? null : response.body.getReader();
+
+  const peekedChunks: Uint8Array[] = [];
+  let peekedBytes = 0;
+  let streamEnded = reader === null;
+
+  while (reader !== null && peekedBytes <= INVALID_EVSID_PEEK_BYTES) {
+    const next = await reader.read();
+    if (next.done) {
+      streamEnded = true;
+      break;
+    }
+    peekedChunks.push(next.value);
+    peekedBytes += next.value.byteLength;
+  }
+
+  if (streamEnded && looksLikeInvalidEvsidResponse(Buffer.concat(peekedChunks))) {
+    return { kind: "invalid-evsid" };
+  }
+
+  let bytesWritten = 0;
+  async function* remainingContent(): AsyncGenerator<Uint8Array> {
+    for (const chunk of peekedChunks) {
+      bytesWritten += chunk.byteLength;
+      yield chunk;
+    }
+    if (streamEnded || reader === null) {
+      return;
+    }
+    while (true) {
+      const next = await reader.read();
+      if (next.done) {
+        return;
+      }
+      bytesWritten += next.value.byteLength;
+      yield next.value;
+    }
+  }
+
+  try {
+    await mkdir(path.dirname(destinationPath), { recursive: true });
+    await pipeline(Readable.from(remainingContent()), createWriteStream(destinationPath));
+  } catch (error) {
+    throw new DestinationWriteError(destinationPath, error instanceof Error ? error.message : String(error));
+  }
+
+  return { kind: "downloaded", bytesWritten };
 }
 
 /**
@@ -552,21 +748,31 @@ export class IdriveClient {
    * Sends a form-encoded `POST` to `path` on `evsHost` authenticated with
    * `evsid`, without parsing the response — the shared low-level primitive
    * behind {@link requestEvs}, {@link requestEvsWithParams}, and
-   * {@link requestEvsRaw}, which differ only in how they build the request
-   * body and interpret the response (parsed JSON/text vs. raw bytes). Takes
-   * a `URLSearchParams` body (rather than a plain field object) so callers
-   * that need repeated keys — e.g. multiple `p` fields for a batch
-   * delete/restore, see {@link requestEvsWithParams} — can pass them via
-   * repeated `URLSearchParams.append` calls, which a plain
+   * {@link downloadEvsToFile}, which differ only in how they build the
+   * request body and interpret the response (parsed JSON/text vs. streamed
+   * bytes). Takes a `URLSearchParams` body (rather than a plain field
+   * object) so callers that need repeated keys — e.g. multiple `p` fields
+   * for a batch delete/restore, see {@link requestEvsWithParams} — can pass
+   * them via repeated `URLSearchParams.append` calls, which a plain
    * `Record<string, string>` can't represent.
    *
    * @param evsHost the EVS host to send the request to.
    * @param evsid the `EVSID` cookie value to authenticate with.
    * @param path the endpoint path, e.g. `/evs/browseFolder`.
    * @param params the form body to send, already built as `URLSearchParams`.
+   * @param signal an optional `AbortSignal` to cancel the request, e.g. on a
+   *   timeout — see {@link downloadEvsToFile}'s bounded-timeout use. Omitted
+   *   by every caller that doesn't need one (JSON-envelope endpoints have no
+   *   large-body risk, so nothing else times out this way).
    * @returns the raw, unread `fetch` `Response`.
    */
-  private postToEvsHost(evsHost: string, evsid: string, path: string, params: URLSearchParams): Promise<Response> {
+  private postToEvsHost(
+    evsHost: string,
+    evsid: string,
+    path: string,
+    params: URLSearchParams,
+    signal?: AbortSignal,
+  ): Promise<Response> {
     return fetch(`https://${evsHost}${path}`, {
       method: "POST",
       headers: {
@@ -574,6 +780,7 @@ export class IdriveClient {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
       },
       body: params,
+      signal,
     });
   }
 
@@ -660,49 +867,121 @@ export class IdriveClient {
   }
 
   /**
-   * Sends a form-encoded `POST` to an endpoint on the account's EVS
-   * satellite host and returns the raw, unparsed response bytes — the
-   * counterpart to {@link requestEvs} for `/evs/*` endpoints whose response
-   * body is the actual payload rather than a JSON envelope (e.g.
-   * `evs/downloadFile`, see `docs/api-map.md`), so callers don't have binary
-   * file content mangled by {@link parseResponseBody}'s text/JSON parsing
-   * and re-encoding. Same `EVSID` bootstrap/caching/retry behavior as
-   * {@link requestEvs}.
+   * Runs a single `evs/downloadFile`-shaped request/peek-then-stream attempt
+   * — the shared body of both the initial try and the post-invalidation
+   * retry inside {@link downloadEvsToFile}, so that method itself only
+   * describes the two-attempt shape rather than repeating the fetch/timeout
+   * wiring twice. Applies {@link DOWNLOAD_TIMEOUT_MS} as a bounded
+   * `AbortController` timeout covering the whole attempt (request plus
+   * however long streaming the body to disk takes), since a stall could
+   * happen at either point.
+   *
+   * @param evsHost the EVS host to send the request to.
+   * @param evsid the `EVSID` cookie value to authenticate this attempt with.
+   * @param path the endpoint path, e.g. `/evs/downloadFile`.
+   * @param params the form body to send, already built as `URLSearchParams`.
+   * @param destinationPath the absolute local file path to stream real
+   *   content to.
+   * @returns the same result shape as {@link peekAndStreamResponseToFile}.
+   * @throws {EvsDownloadHttpError} if the response status wasn't 2xx.
+   * @throws {EvsDownloadTimeoutError} if the attempt didn't finish within
+   *   {@link DOWNLOAD_TIMEOUT_MS}.
+   * @throws {DestinationWriteError} if writing to `destinationPath` failed
+   *   locally.
+   */
+  private async downloadOnce(
+    evsHost: string,
+    evsid: string,
+    path: string,
+    params: URLSearchParams,
+    destinationPath: string,
+  ): Promise<{ kind: "invalid-evsid" } | { kind: "downloaded"; bytesWritten: number }> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+
+    try {
+      const response = await this.postToEvsHost(evsHost, evsid, path, params, controller.signal);
+      if (!response.ok) {
+        const snippet = (await response.text()).slice(0, 500);
+        throw new EvsDownloadHttpError(`received HTTP ${response.status} ${response.statusText}: ${snippet}`);
+      }
+
+      return await peekAndStreamResponseToFile(response, destinationPath);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new EvsDownloadTimeoutError();
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Downloads an `/evs/*` file endpoint's response (e.g. `evs/downloadFile`,
+   * see `docs/api-map.md`) straight to a local file, streaming it rather
+   * than buffering it in memory — the counterpart to {@link requestEvs} for
+   * `/evs/*` endpoints whose response body is real file content rather than
+   * a JSON envelope. Exists because inlining an entire downloaded file into
+   * a single MCP tool response can exceed the MCP stdio transport's message
+   * size cap for anything but small files (see `download_file`'s own
+   * DocBlock in `src/tools/files.ts`); streaming to disk and returning just
+   * the byte count sidesteps that entirely, however large the file is. Same
+   * `EVSID` bootstrap/caching/retry behavior as {@link requestEvs} — see
+   * {@link downloadOnce} for the peek-then-stream mechanics of a single
+   * attempt.
    *
    * @param path the endpoint path, e.g. `/evs/downloadFile`.
    * @param formFields the form fields to send as the request body.
-   * @returns the raw response body bytes, unmodified.
+   * @param destinationPath the absolute local file path to write the
+   *   downloaded content to; its parent directory is created if it doesn't
+   *   already exist.
+   * @returns the number of bytes written to `destinationPath`.
    * @throws {SessionExpiredError} if the configured session has already
    *   expired.
    * @throws {MissingEvsServerError} if the configured cookie has no
    *   `EVS_SERVER` value, so the EVS host can't be determined.
    * @throws {EvsBootstrapError} if the `EVSID` handshake failed and no cached
    *   `EVSID` was usable.
+   * @throws {EvsDownloadHttpError} if either attempt's response status
+   *   wasn't 2xx, or the retry attempt (after minting a fresh `EVSID`) still
+   *   looked like the stale-EVSID error shape.
+   * @throws {EvsDownloadTimeoutError} if an attempt didn't finish within the
+   *   configured timeout.
+   * @throws {DestinationWriteError} if writing to `destinationPath` failed
+   *   locally (e.g. bad path, permissions, disk full).
    * @example
    * ```ts
    * // Mirrors the confirmed evs/downloadFile call in docs/api-map.md
-   * const file = await client.requestEvsRaw("/evs/downloadFile", {
-   *   p: "/C/AMD/Support/licensePLK.txt",
-   *   json: "yes",
-   *   device_id: "D01637267159000960219",
-   * });
-   * // => Buffer<...> (the file's raw content)
+   * const bytesWritten = await client.downloadEvsToFile(
+   *   "/evs/downloadFile",
+   *   { p: "/C/AMD/Support/licensePLK.txt", json: "yes", device_id: "D01637267159000960219" },
+   *   "C:\\Users\\me\\Downloads\\licensePLK.txt",
+   * );
+   * // => 4096
    * ```
    */
-  async requestEvsRaw(path: string, formFields: Record<string, string>): Promise<Buffer> {
+  async downloadEvsToFile(path: string, formFields: Record<string, string>, destinationPath: string): Promise<number> {
     this.assertSessionValid();
     const evsHost = this.requireEvsServerHost();
     const params = new URLSearchParams(formFields);
 
     const evsid = await this.getEvsid(evsHost);
-    const data = Buffer.from(await (await this.postToEvsHost(evsHost, evsid, path, params)).arrayBuffer());
-    if (!looksLikeInvalidEvsidResponse(data)) {
-      return data;
+    const firstAttempt = await this.downloadOnce(evsHost, evsid, path, params, destinationPath);
+    if (firstAttempt.kind === "downloaded") {
+      return firstAttempt.bytesWritten;
     }
 
     this.invalidateEvsid(evsHost);
     const retryEvsid = await this.getEvsid(evsHost);
-    return Buffer.from(await (await this.postToEvsHost(evsHost, retryEvsid, path, params)).arrayBuffer());
+    const retryAttempt = await this.downloadOnce(evsHost, retryEvsid, path, params, destinationPath);
+    if (retryAttempt.kind === "downloaded") {
+      return retryAttempt.bytesWritten;
+    }
+
+    throw new EvsDownloadHttpError(
+      "the response still looked like the stale-EVSID error shape after minting a fresh EVSID and retrying once.",
+    );
   }
 
   /**

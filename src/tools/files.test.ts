@@ -1,9 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { AddressInfo } from "node:net";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { IdriveClient } from "../client/idriveClient.js";
+import { IdriveClient, peekAndStreamResponseToFile } from "../client/idriveClient.js";
 import { extractEvsServerHost } from "../client/session.js";
 import { buildRepeatedPathParams, registerFileTools } from "./files.js";
 
@@ -101,6 +107,95 @@ function parseFirstTextContent(result: { content?: unknown }): unknown {
   assert.equal(content[0].type, "text");
   return JSON.parse(content[0].text);
 }
+
+/**
+ * Starts a local `node:http` server that responds to every request by
+ * writing `body` in many small chunks via repeated `res.write()` calls,
+ * rather than one buffered write — so a response consuming it (like
+ * {@link peekAndStreamResponseToFile}) genuinely has to read the stream
+ * across many chunks, not just unwrap one pre-assembled buffer. Exists so
+ * `peekAndStreamResponseToFile`'s streaming tests below exercise a real
+ * `fetch()` against real chunked HTTP delivery, per this project's standing
+ * rule against tests that don't exercise genuine behavior — not a
+ * hand-mocked `Response`.
+ *
+ * @param body the exact bytes the server responds with on every request.
+ * @param chunkSize how many bytes to write per `res.write()` call.
+ * @returns the running server (call `.close()` when done) and the base URL
+ *   it's listening on.
+ */
+async function startChunkedBodyServer(
+  body: Buffer,
+  chunkSize: number,
+): Promise<{ server: ReturnType<typeof createServer>; url: string }> {
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    for (let offset = 0; offset < body.length; offset += chunkSize) {
+      res.write(body.subarray(offset, offset + chunkSize));
+    }
+    res.end();
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  return { server, url: `http://127.0.0.1:${port}/` };
+}
+
+test("peekAndStreamResponseToFile streams a large multi-chunk response to disk byte-for-byte", async () => {
+  const body = randomBytes(20 * 1024 * 1024); // 20 MB, forces many chunked reads at a 4 KB write size below.
+  const { server, url } = await startChunkedBodyServer(body, 4096);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "idrive-mcp-stream-test-"));
+  const destinationPath = path.join(tmpDir, "downloaded.bin");
+
+  try {
+    const response = await fetch(url);
+    const result = await peekAndStreamResponseToFile(response, destinationPath);
+
+    assert.deepEqual(result, { kind: "downloaded", bytesWritten: body.length });
+    const written = await readFile(destinationPath);
+    assert.ok(written.equals(body), "downloaded file content did not match the sent bytes exactly");
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("peekAndStreamResponseToFile reports the invalid-EVSID shape and writes no file for a small matching body", async () => {
+  const body = Buffer.from(JSON.stringify({ message: "ERROR", desc: "INVALID PARAMETERS" }), "utf8");
+  const { server, url } = await startChunkedBodyServer(body, 32);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "idrive-mcp-stream-test-"));
+  const destinationPath = path.join(tmpDir, "should-not-exist.bin");
+
+  try {
+    const response = await fetch(url);
+    const result = await peekAndStreamResponseToFile(response, destinationPath);
+
+    assert.deepEqual(result, { kind: "invalid-evsid" });
+    await assert.rejects(() => stat(destinationPath), /ENOENT/);
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("peekAndStreamResponseToFile treats a small, differently-shaped JSON body as real downloaded content", async () => {
+  const body = Buffer.from(JSON.stringify({ message: "SUCCESS", size: "123", lmd: "1700000000" }), "utf8");
+  const { server, url } = await startChunkedBodyServer(body, 16);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "idrive-mcp-stream-test-"));
+  const destinationPath = path.join(tmpDir, "downloaded.json");
+
+  try {
+    const response = await fetch(url);
+    const result = await peekAndStreamResponseToFile(response, destinationPath);
+
+    assert.deepEqual(result, { kind: "downloaded", bytesWritten: body.length });
+    const written = await readFile(destinationPath);
+    assert.ok(written.equals(body), "downloaded file content did not match the sent bytes exactly");
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
 
 if (!cookie) {
   test("list_files (skipped: IDRIVE_COOKIE not set)", { skip: true }, () => {});
@@ -227,7 +322,7 @@ if (!cookie) {
     return file ? `${evsPath}/${file.name as string}` : null;
   }
 
-  test("download_file downloads a real backed-up file's raw content via the EVS endpoint", async (t) => {
+  test("download_file downloads a real backed-up file's raw content to a local destination file via the EVS endpoint", async (t) => {
     const client = await connectTestClient();
     const filePath = await findRealFilePath(client);
     if (!filePath) {
@@ -235,17 +330,35 @@ if (!cookie) {
       return;
     }
 
-    const result = await client.callTool({
-      name: "download_file",
-      arguments: { deviceId, path: filePath },
-    });
+    // findRealFilePath picks whatever file happens to sort first under IDRIVE_TEST_EVS_PATH — that's
+    // very likely a small file, so this test exercises the tool end-to-end but doesn't by itself prove
+    // the large-file fix (base64-inlining a whole file used to blow past the MCP stdio transport's
+    // message size cap above ~7.4 MB). The dedicated peek-then-stream unit test below, against a real
+    // ~20 MB multi-chunk HTTP response, is what actually proves that.
+    const destinationPath = path.join(
+      os.tmpdir(),
+      `idrive-mcp-download-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
 
-    assert.notEqual(result.isError, true, `tool returned an error: ${JSON.stringify(result)}`);
-    const content = result.content as Array<{ type: string; resource: { uri: string; mimeType: string; blob: string } }>;
-    assert.ok(Array.isArray(content) && content.length > 0, "expected at least one content item");
-    assert.equal(content[0].type, "resource");
-    assert.equal(typeof content[0].resource.blob, "string");
-    assert.ok(content[0].resource.blob.length > 0, "expected non-empty base64 file content");
+    try {
+      const result = await client.callTool({
+        name: "download_file",
+        arguments: { deviceId, path: filePath, destinationPath },
+      });
+
+      assert.notEqual(result.isError, true, `tool returned an error: ${JSON.stringify(result)}`);
+      const downloaded = parseFirstTextContent(result as { content?: unknown }) as {
+        path: string;
+        bytesWritten: number;
+      };
+      assert.equal(downloaded.path, destinationPath);
+      assert.ok(downloaded.bytesWritten > 0, "expected a non-zero bytesWritten");
+
+      const fileStat = await stat(destinationPath);
+      assert.equal(fileStat.size, downloaded.bytesWritten);
+    } finally {
+      await rm(destinationPath, { force: true });
+    }
   });
 
   test("get_file_properties fetches real metadata for a backed-up file via the EVS endpoint", async (t) => {

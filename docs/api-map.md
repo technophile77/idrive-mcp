@@ -10,13 +10,58 @@ This particular UI reads as an IT-style **"Remote Management" backup console**: 
 
 **Update**: a second HAR confirmed there's a *second* app surface — the actual `/idrive/home` consumer file browser, which talks to a per-account satellite host (`evsweb*.idrive.com`, see "Second app surface" below), not `idriveent`. Share/rename/move/create-folder most likely live there instead, under `/evs/*`, alongside `browseFolder`/`getThumbnail` — just not yet captured. User confirmed (2026-08-26) they do use these features day-to-day and will send further curls — treat this as "still pending capture," not "doesn't exist."
 
-## Auth flow (reference only — v1 uses manual cookie, not automated login)
+## Auth flow — `/idrive/login/*` (CONFIRMED, live-captured 2026-08-30)
 
-1. `POST /idriveent/login/validateUser` — form fields `userId` (email), `token` (a numeric code — this account has 2FA/OTP, not a plain password post; the password step wasn't captured, it happens earlier), `supportLogin`. Returns `302` with `Set-Cookie` for the session (`JSESSIONID`, `SES_TOKEN` JWT, etc. — same cookies as the original example).
-2. Trusted-device / WebOTP: `POST /idriveent/trusted/sendWEBOTP`, `POST /idriveent/trusted/verifyWEBOTP` — unconfirmed shape.
-3. `POST /idriveent/login/logout`, `GET/POST /idriveent/logout` — end session.
+This is the real `/idrive/home` consumer login (distinct from the `idriveent` console's `validateUser` below, which appears to be a separate/legacy login path — not investigated further since this is the one the actual web UI uses).
 
-`SES_TOKEN` is a JWT (`{user_id, id, sub, iat, exp}`); `exp` is ~24h after `iat` in the example given. The MCP server should decode this locally (no signature check needed, just read `exp`) to fail fast with a clear "refresh your cookie" error instead of letting a stale-session request fail cryptically downstream.
+### Fresh login (email + password) — requires a real browser + human
+
+`GET /idrive/login/loginForm` renders the login page, which embeds a **visible Google reCAPTCHA v2 checkbox** (`size=normal`, confirmed sitekey varies per page load) directly in the form, plus a per-page-load CSRF token as a hidden input:
+```html
+<input type="hidden" name="csrftoken" id="csrftoken" value="..."/>
+```
+
+Submitting the form does `POST /idrive/login/validateLogin`, form-encoded:
+```
+loggingIntoParam=&support=&csrftoken=<scraped from loginForm's hidden input>
+&email=<email>&password=<plaintext password>&from=singleLogin&remember=on
+&g-recaptcha-response=<reCAPTCHA v2 token>&dcflag=E&dcflag_alt=O
+```
+**`g-recaptcha-response` is mandatory and cannot be produced without a real browser rendering Google's reCAPTCHA JS and a human clicking/solving the checkbox widget** — this is a hard block on any pure-HTTP/headless automation of a fresh login. (`remember=on` is what causes a long-lived `REMEMBER_ME_COOKIE` to be issued at the end of the flow — see below. `password` is sent as plaintext over TLS, not client-side hashed or encrypted, despite the app bundle shipping AES/PBKDF2 code elsewhere — that code is for the separate private-encryption-key backup feature, unrelated to login.)
+
+Response: `200`, an HTML page rendering the OTP-entry screen (itself containing a fresh `csrftoken` hidden input for the next step).
+
+`POST /idrive/login/vefifyTwoStepAuth` — form: `otppasscode=<6-digit code>` only (no CSRF token, relies on the `JSESSIONID` cookie already established from the `loginForm` GET). Response: `200`, plain text `SUCCESS` (7 bytes) on a correct code. Failure-case response text not captured.
+
+`POST /idrive/login/validateLogin` (called a **second** time to finalize) — form:
+```
+g-recaptcha-response=&csrftoken=<scraped from the OTP-screen HTML>&op_type=&desktop_token=&from=singleLogin
+```
+(`g-recaptcha-response` empty — not needed again.) Response: `302` to `/idrive/home/account.html#editprofile_info`, with `Set-Cookie`:
+- `SES_TOKEN` (JWT, `HttpOnly`) — same shape as documented elsewhere in this file, `exp` ≈ `iat` + 24h.
+- `CHECKINSESSION`, `EVS_SERVER`, `EVS_SERVER_SYNC`, `WOPI_SESSION` — same as every other confirmed session in this doc.
+- **`REMEMBER_ME_COOKIE`** (only because `remember=on` was sent) — format `<email>_<opaque token>`, `Max-Age=31536000` (**1 year**), **not `HttpOnly`** (readable by page JS — this is how the login page's own client-side code detects a remembered device without a server round-trip, see below).
+
+### `REMEMBER_ME_COOKIE` — retested, does not skip anything (correction)
+
+An earlier pass through this investigation observed a login sequence that appeared to skip straight from `loginForm` to the OTP screen (no password submission visible) whenever a `REMEMBER_ME_COOKIE` was present, and concluded the cookie alone was enough to bypass password + captcha. **That conclusion was wrong** — most likely a misread caused by other stale session state in that browser profile at the time, not a real effect of the cookie. Retested twice, cleanly, afterward:
+- A bare `GET /idrive/login/loginForm` sending *only* `REMEMBER_ME_COOKIE` (no other cookies at all, via a plain HTTP request) returns the ordinary email+password form HTML — not an OTP screen.
+- In a real browser holding a freshly-issued, valid `REMEMBER_ME_COOKIE`, loading the login page again still rendered the full password form with the same visible `size=normal` reCAPTCHA checkbox as a completely cookie-less login.
+- Submitting real credentials through that form (with `REMEMBER_ME_COOKIE` present throughout) still landed on the OTP screen — 2FA was not skipped either.
+
+**Conclusion: `REMEMBER_ME_COOKIE` does not appear to shortcut any step of this login flow** (not password, not captcha, not OTP) as of this account/app version. Its purpose, if any, wasn't identified. Combined with the OTP-every-time and mandatory-visible-captcha findings above, **no part of obtaining or renewing a session can be automated without a human completing the full captcha + password + OTP flow in a real browser, every time** (roughly every ~24h, `SES_TOKEN`'s lifetime).
+
+### Why this project doesn't attempt a CLI login feature
+
+A CLI login command (prompt for credentials, obtain a session programmatically) was designed and implemented against the incorrect "remember-me skips OTP" assumption above, then reverted once live retesting disproved it (2026-08-30) — there is no remaining automatable path once that assumption falls: the captcha alone blocks any headless password submission, and OTP blocks any headless renewal even when a password/cookie is already held. This project sticks with the original manual `IDRIVE_COOKIE` approach (copy a `Cookie:` header from an already-logged-in browser session) as a result — see `README.md`.
+
+### Other login-adjacent endpoints (from the earlier `idriveent`-console investigation — likely a separate/legacy path, not used by the flow above)
+
+1. `POST /idriveent/login/validateUser` — form fields `userId` (email), `token` (a numeric code), `supportLogin`. Returns `302` with the same `Set-Cookie` set. Unclear whether this is still reachable/used by the current `/idrive/home` UI or a legacy path from an older console version — not pursued further since the `/idrive/login/*` flow above is confirmed to be what the real login page uses.
+2. `POST /idriveent/trusted/sendWEBOTP`, `POST /idriveent/trusted/verifyWEBOTP` — unconfirmed shape, likely superseded by `vefifyTwoStepAuth` above.
+3. `POST /idriveent/login/logout`, `GET/POST /idriveent/logout`, and (confirmed reachable) `GET /idrive/logout` — end session.
+
+`SES_TOKEN` is a JWT (`{user_id, id, read_only, sub, iat, exp}`); `exp` is ~24h after `iat`. The MCP server should decode this locally (no signature check needed, just read `exp`) to fail fast with a clear "refresh your session" error instead of letting a stale-session request fail cryptically downstream.
 
 ## CSRF
 
@@ -157,6 +202,8 @@ Form: `json=yes` — **no username/account-email field needed at all**, unlike t
 
 ### `POST https://<evs-host>/evs/downloadFile` — CONFIRMED, download a file's actual content
 Form: `p` (file path, e.g. `/C/AMD/.../licensePLK.txt`), `json=yes`, `device_id`. **The response body IS the raw file content** (verified on a small text file — response bytes matched the file's real content, UTF-16-encoded text in this case; presumably raw bytes for any file type, `Content-Type` is unreliable — always `text/plain;charset=UTF-8` regardless of actual file type, so must be treated as an opaque byte stream, not trusted for type detection). No separate "prepare/poll/fetch" step — a single call returns the whole file. This is different from what the user's browser actually does when they click "download" in the UI (see below) but is far better suited to programmatic use.
+
+Implementation note (MCP layer, not an iDrive API detail): the `download_file` tool streams this response straight to a caller-supplied local file rather than returning it inline, because the `@modelcontextprotocol/sdk` `StdioClientTransport` caps a single JSON-RPC stdio message at 10 MiB — base64-inlining a whole downloaded file into one tool response exceeded that cap for anything above roughly ~7.4 MB raw. iDrive's own HTTP contract above is unaffected by this — it's purely how this server's tool consumes the response.
 
 ### The UI's actual download flow (why the original HAR captures never saw it)
 Confirmed from the app bundle (`All-Compressed-Idrive.js`): clicking "download" in the UI calls `POST /idrive/home/trusted/checkWEBip` first (trust check), then does `window.open("https://<evs-host>/evs/v1/downloadFile?version=0&p=<encoded path>&device_id=<id>", "_blank")` — a **new-tab navigation**, not an XHR/fetch. Chrome DevTools' Network panel only records the tab it's attached to, so this download never appeared in any of the HARs the user exported from the original tab — confirmed the diagnosis given earlier in this session. `evs/downloadFile` (above) is the better-suited endpoint for this MCP server; `v1/downloadFile` is documented here for completeness but not needed.

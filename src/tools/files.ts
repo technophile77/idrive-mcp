@@ -1,7 +1,16 @@
+import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { EvsBootstrapError, IdriveClient, MissingEvsServerError, SessionExpiredError } from "../client/idriveClient.js";
+import {
+  DestinationWriteError,
+  EvsBootstrapError,
+  EvsDownloadHttpError,
+  EvsDownloadTimeoutError,
+  IdriveClient,
+  MissingEvsServerError,
+  SessionExpiredError,
+} from "../client/idriveClient.js";
 import type {
   BrowseFolderEntry,
   BrowseFolderResponse,
@@ -90,6 +99,26 @@ const evsFilePathInputShape = {
       "The iDrive device ID the file was backed up from, e.g. as returned by the sibling `list_devices` tool's `device_id` field.",
     ),
   path: z.string().min(1).describe(EVS_PATH_DESCRIPTION),
+};
+
+/**
+ * Input shape for `download_file`, extending {@link evsFilePathInputShape}
+ * with the destination it streams to. `destinationPath` is required (not
+ * defaulted) — see `download_file`'s own DocBlock for why there's no
+ * server-side default download directory.
+ */
+const downloadFileInputShape = {
+  ...evsFilePathInputShape,
+  destinationPath: z
+    .string()
+    .min(1)
+    .refine(path.isAbsolute, {
+      message: "destinationPath must be an absolute local file path (e.g. \"C:\\Users\\me\\Downloads\\file.txt\" or \"/home/me/file.txt\"), not a relative one.",
+    })
+    .describe(
+      "The absolute local file path to stream the downloaded content to (its parent directory is created if " +
+        "missing). Always required — this tool never chooses a download location on its own.",
+    ),
 };
 
 const createFolderInputShape = {
@@ -443,41 +472,57 @@ function isNoFileVersionsResponse(body: unknown): body is NoFileVersionsResponse
 }
 
 /**
- * Best-effort heuristic that checks whether `evs/downloadFile`'s raw
- * response bytes are actually iDrive's small JSON error envelope
- * (`{"message":"<not SUCCESS>",...}`) rather than real downloaded file
- * content. This can never be fully reliable: a genuine, tiny binary or text
- * file whose bytes happen to parse as JSON with a non-`"SUCCESS"` `message`
- * field would be misdiagnosed as an error — `download_file`'s own DocBlock
- * documents this limitation rather than pretending it doesn't exist. The
- * size cap keeps this cheap and avoids attempting to UTF-8-decode large
- * binary payloads.
+ * Builds the tool-error `CallToolResult` returned when
+ * `download_file`/`IdriveClient.downloadEvsToFile` failed with an
+ * {@link EvsDownloadHttpError} — either attempt's response wasn't a 2xx
+ * status, or the response still looked like the stale-EVSID error shape
+ * after a retry — so the tool surfaces that already-clear message instead of
+ * an uncaught exception.
  *
- * @param data the raw response bytes from `evs/downloadFile`.
- * @returns the parsed `message`/`desc` fields if `data` looks like an error
- *   envelope, or `null` if it should be treated as real file content.
+ * @param error the caught download HTTP error; its own message already
+ *   explains what went wrong.
+ * @returns an MCP tool result with `isError: true` quoting `error.message`.
  */
-function looksLikeDownloadFileErrorResponse(data: Buffer): { message: string; desc?: string } | null {
-  if (data.byteLength > 512) {
-    return null;
-  }
+function buildEvsDownloadHttpErrorResult(error: EvsDownloadHttpError): CallToolResult {
+  return {
+    isError: true,
+    content: [{ type: "text", text: error.message }],
+  };
+}
 
-  try {
-    const parsed: unknown = JSON.parse(data.toString("utf8"));
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      typeof (parsed as { message?: unknown }).message === "string" &&
-      (parsed as { message?: unknown }).message !== "SUCCESS"
-    ) {
-      const { message, desc } = parsed as { message: string; desc?: unknown };
-      return { message, desc: typeof desc === "string" ? desc : undefined };
-    }
-  } catch {
-    // Not JSON at all — real (likely binary) file content, not an error envelope.
-  }
+/**
+ * Builds the tool-error `CallToolResult` returned when a `download_file`
+ * attempt was aborted for taking too long (see {@link EvsDownloadTimeoutError}),
+ * so a genuinely stalled connection surfaces a clear message instead of an
+ * uncaught exception.
+ *
+ * @param error the caught download timeout error; its own message already
+ *   explains the timeout.
+ * @returns an MCP tool result with `isError: true` quoting `error.message`.
+ */
+function buildEvsDownloadTimeoutErrorResult(error: EvsDownloadTimeoutError): CallToolResult {
+  return {
+    isError: true,
+    content: [{ type: "text", text: error.message }],
+  };
+}
 
-  return null;
+/**
+ * Builds the tool-error `CallToolResult` returned when `download_file`
+ * couldn't write the downloaded content to the caller-supplied
+ * `destinationPath` locally (see {@link DestinationWriteError}), so a bad
+ * path/permissions/disk-full problem surfaces a clear message instead of an
+ * uncaught exception.
+ *
+ * @param error the caught local write error; its own message already names
+ *   the destination path and what went wrong.
+ * @returns an MCP tool result with `isError: true` quoting `error.message`.
+ */
+function buildDestinationWriteErrorResult(error: DestinationWriteError): CallToolResult {
+  return {
+    isError: true,
+    content: [{ type: "text", text: error.message }],
+  };
 }
 
 /**
@@ -692,13 +737,15 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
     {
       title: "Download File (EVS)",
       description:
-        "Downloads a backed-up file's actual content, via the EVS-hosted `evs/downloadFile` endpoint. Unlike " +
-        "`browse_folder`/`list_files` (which only list metadata), this returns the file's real bytes in a " +
-        "single call — use `browse_folder` or `list_files` first to discover the `path` of the file you want. " +
-        "Note: iDrive's `Content-Type` header on this endpoint is NOT trustworthy for identifying the real file " +
-        "type (it's always `text/plain;charset=UTF-8` regardless of actual content) — the returned data is an " +
-        "opaque byte stream; use the file's own name/extension (from a prior listing) to infer its type instead.",
-      inputSchema: evsFilePathInputShape,
+        "Downloads a backed-up file's actual content, via the EVS-hosted `evs/downloadFile` endpoint, streaming " +
+        "it straight to a local file at the required `destinationPath` rather than returning it inline — large " +
+        "files inlined into a single tool response can exceed the MCP stdio transport's message size limit, so " +
+        "this tool always writes to disk and reports back `{ path, bytesWritten }` instead. Use `browse_folder` " +
+        "or `list_files` first to discover the `path` of the file you want. Note: iDrive's `Content-Type` header " +
+        "on this endpoint is NOT trustworthy for identifying the real file type (it's always " +
+        "`text/plain;charset=UTF-8` regardless of actual content) — the downloaded data is an opaque byte " +
+        "stream; use the file's own name/extension (from a prior listing) to infer its type instead.",
+      inputSchema: downloadFileInputShape,
       annotations: {
         title: "Download File (EVS)",
         readOnlyHint: true,
@@ -706,32 +753,16 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
         openWorldHint: true,
       },
     },
-    async ({ deviceId, path }): Promise<CallToolResult> => {
+    async ({ deviceId, path, destinationPath }): Promise<CallToolResult> => {
       try {
-        const data = await client.requestEvsRaw(DOWNLOAD_FILE_PATH, {
-          p: path,
-          json: "yes",
-          device_id: deviceId,
-        });
-
-        const errorEnvelope = looksLikeDownloadFileErrorResponse(data);
-        if (errorEnvelope !== null) {
-          return buildIdriveErrorResult(
-            errorEnvelope.desc !== undefined ? `${errorEnvelope.message}: ${errorEnvelope.desc}` : errorEnvelope.message,
-          );
-        }
+        const bytesWritten = await client.downloadEvsToFile(
+          DOWNLOAD_FILE_PATH,
+          { p: path, json: "yes", device_id: deviceId },
+          destinationPath,
+        );
 
         return {
-          content: [
-            {
-              type: "resource",
-              resource: {
-                uri: `idrive://device/${deviceId}${path}`,
-                mimeType: "application/octet-stream",
-                blob: data.toString("base64"),
-              },
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify({ path: destinationPath, bytesWritten }) }],
         };
       } catch (error) {
         if (error instanceof SessionExpiredError) {
@@ -742,6 +773,15 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
         }
         if (error instanceof EvsBootstrapError) {
           return buildEvsBootstrapErrorResult(error);
+        }
+        if (error instanceof EvsDownloadHttpError) {
+          return buildEvsDownloadHttpErrorResult(error);
+        }
+        if (error instanceof EvsDownloadTimeoutError) {
+          return buildEvsDownloadTimeoutErrorResult(error);
+        }
+        if (error instanceof DestinationWriteError) {
+          return buildDestinationWriteErrorResult(error);
         }
         throw error;
       }

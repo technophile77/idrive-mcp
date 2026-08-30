@@ -79,11 +79,15 @@ instead:
   preview image for a backed-up file via the EVS-hosted `evs/getThumbnail`
   endpoint, returned as MCP image content.
 - **`download_file`** — `deviceId` (required), `path` (required, same EVS
-  format as `browse_folder`). Downloads a backed-up file's actual content via
-  the EVS-hosted `evs/downloadFile` endpoint, returned as base64-encoded MCP
-  resource content. iDrive's `Content-Type` on this endpoint is not
-  trustworthy for identifying the real file type — infer it from the file's
-  name/extension instead.
+  format as `browse_folder`), `destinationPath` (required, an absolute local
+  file path). Downloads a backed-up file's actual content via the EVS-hosted
+  `evs/downloadFile` endpoint, streaming it straight to `destinationPath`
+  (creating its parent directory if needed) rather than returning it inline —
+  large files inlined into a single tool response can exceed the MCP stdio
+  transport's message size limit, so this tool always writes to disk and
+  returns `{ path, bytesWritten }` instead. iDrive's `Content-Type` on this
+  endpoint is not trustworthy for identifying the real file type — infer it
+  from the file's name/extension instead.
 - **`get_file_properties`** — `deviceId` (required), `path` (required, same
   EVS format as `browse_folder`). Fetches size/last-modified metadata for a
   single backed-up file or folder via the EVS-hosted `evs/getProperties`
