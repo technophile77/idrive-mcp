@@ -5,9 +5,10 @@ import { IdriveClient } from "./client/idriveClient.js";
 import { registerAccountTools } from "./tools/account.js";
 import { registerDeviceTools } from "./tools/devices.js";
 import { registerFileTools } from "./tools/files.js";
+import { registerServerTools } from "./tools/server.js";
+import { getServerVersion } from "./version.js";
 
 const SERVER_NAME = "idrive-mcp-server";
-const SERVER_VERSION = "0.1.0";
 
 /**
  * Starts the iDrive MCP server: validates config, wires up the shared iDrive
@@ -24,12 +25,13 @@ async function main(): Promise<void> {
 
   const server = new McpServer({
     name: SERVER_NAME,
-    version: SERVER_VERSION,
+    version: getServerVersion().displayVersion,
   });
 
   registerAccountTools(server, idriveClient);
   registerDeviceTools(server, idriveClient);
   registerFileTools(server, idriveClient);
+  registerServerTools(server);
 
   // TODO: register remaining tools from src/tools/*.ts here
 
