@@ -197,6 +197,50 @@ test("peekAndStreamResponseToFile treats a small, differently-shaped JSON body a
   }
 });
 
+test("peekAndStreamResponseToFile reports the unexpected-html shape and writes no file for a marketing-homepage-sized HTML body", async () => {
+  // Realistically sized (a few KB) rather than tiny, and far larger than
+  // INVALID_EVSID_PEEK_BYTES (256) — mirrors the confirmed ~34KB iDrive
+  // marketing homepage that evs/downloadFile falls back to serving when the
+  // requested path doesn't resolve to a real file for the device.
+  const filler = "<!-- padding to make this a realistically sized page --><p>Online Backup for PC, Mac and iPhone</p>\n".repeat(60);
+  const body = Buffer.from(
+    `<!DOCTYPE html>\n<html><head><title>Online Backup for PC, Mac and iPhone | IDrive</title></head><body>${filler}</body></html>`,
+    "utf8",
+  );
+  const { server, url } = await startChunkedBodyServer(body, 512);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "idrive-mcp-stream-test-"));
+  const destinationPath = path.join(tmpDir, "should-not-exist.bin");
+
+  try {
+    const response = await fetch(url);
+    const result = await peekAndStreamResponseToFile(response, destinationPath);
+
+    assert.deepEqual(result, { kind: "unexpected-html" });
+    await assert.rejects(() => stat(destinationPath), /ENOENT/);
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("peekAndStreamResponseToFile treats an HTML-looking body preceded by whitespace as unexpected-html too", async () => {
+  const body = Buffer.from(`   \n\t<HTML><body>${"x".repeat(4000)}</body></html>`, "utf8");
+  const { server, url } = await startChunkedBodyServer(body, 128);
+  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "idrive-mcp-stream-test-"));
+  const destinationPath = path.join(tmpDir, "should-not-exist.bin");
+
+  try {
+    const response = await fetch(url);
+    const result = await peekAndStreamResponseToFile(response, destinationPath);
+
+    assert.deepEqual(result, { kind: "unexpected-html" });
+    await assert.rejects(() => stat(destinationPath), /ENOENT/);
+  } finally {
+    server.close();
+    await rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
 if (!cookie) {
   test("list_files (skipped: IDRIVE_COOKIE not set)", { skip: true }, () => {});
 } else if (!deviceId) {

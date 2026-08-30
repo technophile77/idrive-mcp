@@ -475,9 +475,10 @@ function isNoFileVersionsResponse(body: unknown): body is NoFileVersionsResponse
  * Builds the tool-error `CallToolResult` returned when
  * `download_file`/`IdriveClient.downloadEvsToFile` failed with an
  * {@link EvsDownloadHttpError} — either attempt's response wasn't a 2xx
- * status, or the response still looked like the stale-EVSID error shape
- * after a retry — so the tool surfaces that already-clear message instead of
- * an uncaught exception.
+ * status, or the response still looked like the stale-EVSID error shape or
+ * an HTML document after a retry (the latter is a known iDrive behavior when
+ * the requested path doesn't resolve to a real file/folder) — so the tool
+ * surfaces that already-clear message instead of an uncaught exception.
  *
  * @param error the caught download HTTP error; its own message already
  *   explains what went wrong.

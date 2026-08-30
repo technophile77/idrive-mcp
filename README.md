@@ -105,6 +105,16 @@ instead:
   scrape, not a stable API) and reflects the page's own "Sync" quota naming
   specifically; whether it also represents total usage across device backups
   is unconfirmed.
+- **`get_server_version`** — no input, and doesn't call iDrive's API at all.
+  Returns `{ packageVersion, gitDescriptor, displayVersion }` for the exact
+  build of this server currently running (`package.json`'s `version` plus a
+  `git describe --always --dirty --broken` commit descriptor). Exists
+  because this project doesn't bump `package.json`'s version on every fix,
+  so a stale, already-running server process (e.g. one started before a
+  bug fix was compiled) can otherwise be indistinguishable from a freshly
+  rebuilt one until something breaks — this tool lets you check which build
+  you're actually talking to, from inside a conversation, without manually
+  diffing timestamps or commits.
 
 ### Mutating tools
 
