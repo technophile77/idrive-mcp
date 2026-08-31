@@ -31,6 +31,17 @@ const INVALID_EVSID_PEEK_BYTES = 256;
 /** `Referer` header value used for calls to a per-account EVS satellite host, distinct from the idriveent console's `Referer` (see `docs/api-map.md`'s "Second app surface" section). */
 const EVS_REFERER = "https://www.idrive.com/";
 
+/**
+ * The form field name every path-taking `/evs/*` endpoint uses for the
+ * target file/folder path (e.g. `evs/browseFolder`, `evs/getProperties`,
+ * `evs/v1/deleteFile`'s repeated field). Shared by
+ * {@link IdriveClient.requestEvsWithParams} and
+ * {@link IdriveClient.downloadEvsToFile} so both apply
+ * {@link buildAlternateNormalizationParams} to the same field name rather
+ * than two copies of the literal `"p"` drifting apart.
+ */
+const EVS_PATH_FIELD = "p";
+
 /** Static User-Agent copied verbatim from a captured browser session against idrive.com. */
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
@@ -343,6 +354,124 @@ function isInvalidEvsidResponse(body: unknown): boolean {
 }
 
 /**
+ * Checks whether a parsed response body is iDrive's "path doesn't resolve"
+ * error shape (`{"message":"ERROR","desc":"INVALID PATH"}`), so
+ * {@link IdriveClient} can tell this apart from other business errors and
+ * retry once with the path's alternate Unicode normalization (see
+ * {@link buildAlternateNormalizationParams}) before giving up — confirmed
+ * live: `evs/getProperties` for a real, existing path returns exactly this
+ * shape when the path is sent in NFC (precomposed) form while the device's
+ * own index stores it in NFD (decomposed) form, or vice versa, and
+ * `idriveent/remote/getRestoreData` returns the identical shape for the same
+ * kind of mismatch.
+ *
+ * **Not an exclusive normalization signal**: per `docs/api-map.md`'s "Trash
+ * listing — still unresolved" section (~line 249), `evs/browseFolder` with
+ * `trash=yes` on `/C` or `/` also returns this exact shape for an unrelated
+ * reason (no such "list trash" mechanism exists). Treating it as
+ * retry-worthy is still safe here — the retry is bounded to one extra
+ * request, and whatever comes back is always iDrive's real answer to the
+ * literal retried request, never a fabricated success.
+ *
+ * @param body the parsed JSON response body from an iDrive API call.
+ * @returns `true` only when `body` matches the exact `INVALID PATH` shape.
+ */
+function isInvalidPathResponse(body: unknown): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as { message?: unknown }).message === "ERROR" &&
+    (body as { desc?: unknown }).desc === "INVALID PATH"
+  );
+}
+
+/**
+ * Builds the Unicode-normalization form a caller *didn't* supply for a
+ * single path-like string, so a request that failed because the two sides
+ * disagree on precomposed (NFC) vs. decomposed (NFD) accented characters can
+ * be retried once with the other form — see `isInvalidPathResponse` above
+ * for the confirmed root cause this exists to work around (a Mac-sourced
+ * device indexes paths in NFD, matching macOS/APFS's own on-disk
+ * representation, while any typed/LLM-generated path naturally arrives as
+ * NFC). Bidirectional on purpose: a future non-Mac-sourced device could need
+ * the opposite retry direction, so this never hardcodes "always try NFD
+ * second".
+ *
+ * @param value the path (or path segment) as supplied by the caller.
+ * @returns `null` if `value` is already normalization-invariant (i.e. pure
+ *   ASCII, or otherwise has no decomposable characters — `value.normalize("NFC")
+ *   === value.normalize("NFD")`), since retrying would be pointless.
+ *   Otherwise, whichever of NFC/NFD `value` doesn't already equal.
+ * @example
+ * ```ts
+ * buildAlternateNormalization("café"); // NFC input => "café" (NFD, distinct code points)
+ * buildAlternateNormalization("café".normalize("NFD")); // => "café" (NFC)
+ * buildAlternateNormalization("plain-ascii.txt"); // => null
+ * ```
+ */
+export function buildAlternateNormalization(value: string): string | null {
+  const nfc = value.normalize("NFC");
+  const nfd = value.normalize("NFD");
+  if (nfc === nfd) {
+    return null;
+  }
+
+  return value === nfc ? nfd : nfc;
+}
+
+/**
+ * Builds a retry `URLSearchParams` body with every current value of
+ * `fieldName` mapped through {@link buildAlternateNormalization}, so a
+ * batch-capable EVS call (e.g. `evs/v1/deleteFile`'s repeated `p` field, see
+ * {@link IdriveClient.requestEvsWithParams}) shares the exact same
+ * normalization-retry code path as a single-path call.
+ *
+ * **Known accepted limitation** (unconfirmed against the real API, unlike
+ * the single-path case): when only one of several `fieldName` values in a
+ * batch call is mis-normalized, this flips *all* of them to their alternate
+ * form rather than just the mismatched one — precision here would need
+ * another live test against a real multi-path mismatch, which hasn't been
+ * done. Acceptable for this pass since the retry is still bounded to one
+ * extra request and iDrive's response reports a result per path, so a
+ * partial failure stays visible rather than silent.
+ *
+ * @param params the original form body to build a retry variant of.
+ * @param fieldName the repeatable field to remap, e.g. `"p"` (see
+ *   {@link EVS_PATH_FIELD}).
+ * @returns `null` if every current value of `fieldName` was already
+ *   normalization-invariant (no point retrying), or a clone of `params` with
+ *   each `fieldName` occurrence replaced by its alternate normalization
+ *   (values with no alternate are left as-is).
+ * @example
+ * ```ts
+ * const params = new URLSearchParams({ json: "yes", device_id: "D01" });
+ * params.append("p", "café".normalize("NFC"));
+ * buildAlternateNormalizationParams(params, "p")?.getAll("p");
+ * // => ["café" (NFD, distinct code points)]
+ * ```
+ */
+export function buildAlternateNormalizationParams(params: URLSearchParams, fieldName: string): URLSearchParams | null {
+  const alternates = params.getAll(fieldName).map(buildAlternateNormalization);
+  if (alternates.every((alternate) => alternate === null)) {
+    return null;
+  }
+
+  const result = new URLSearchParams();
+  let fieldIndex = 0;
+  for (const [key, value] of params.entries()) {
+    if (key !== fieldName) {
+      result.append(key, value);
+      continue;
+    }
+
+    result.append(key, alternates[fieldIndex] ?? value);
+    fieldIndex += 1;
+  }
+
+  return result;
+}
+
+/**
  * Best-effort check for the "stale or missing `EVSID`" error shape (see
  * {@link isInvalidEvsidResponse}) in a raw response body, for `/evs/*`
  * endpoints that return arbitrary bytes rather than a `Content-Type` the
@@ -507,7 +636,14 @@ export async function peekAndStreamResponseToFile(
  * form-encoded POST and plain GET request shapes documented in
  * `docs/api-map.md`, applies the browser-mimicking headers iDrive expects on
  * every call, and fails fast on an expired session instead of letting a
- * stale cookie produce a confusing HTTP error deep in tool code.
+ * stale cookie produce a confusing HTTP error deep in tool code. Implements
+ * three sibling "detect a known-bad response shape, retry once with an
+ * adjusted request" behaviors: `EVSID` staleness (see
+ * {@link isInvalidEvsidResponse}/{@link invalidateEvsid}), the `evs/downloadFile`
+ * HTML-marketing-page fallback (see {@link looksLikeHtmlResponse}), and — the
+ * most recently added — Unicode normalization mismatches between a
+ * caller-supplied path and how a device (confirmed: a Mac) indexes it (see
+ * {@link isInvalidPathResponse}/{@link buildAlternateNormalizationParams}).
  *
  * @example
  * ```ts
@@ -572,8 +708,44 @@ export class IdriveClient {
   }
 
   /**
+   * Sends a form-encoded `POST` to `path` on `www.idrive.com`, without
+   * parsing the response — the shared low-level primitive behind
+   * {@link request}, split out (mirroring {@link postToEvsHost}) so
+   * {@link request}'s normalization-retry branch can send a second request
+   * with an alternate-normalized body without duplicating the fetch/header
+   * wiring.
+   *
+   * @param path the endpoint path, e.g. `/idriveent/remote/getRestoreData`.
+   * @param params the form body to send, already built as `URLSearchParams`.
+   * @returns the raw, unread `fetch` `Response`.
+   */
+  private postToIdrive(path: string, params: URLSearchParams): Promise<Response> {
+    return fetch(`${IDRIVE_ORIGIN}${path}`, {
+      method: "POST",
+      headers: {
+        ...buildDefaultHeaders(this.cookie, `${IDRIVE_ORIGIN}/idrive/home`),
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+      body: params,
+    });
+  }
+
+  /**
    * Sends a form-encoded `POST` to an iDrive API endpoint — the shape used
-   * by almost every endpoint in `docs/api-map.md`.
+   * by almost every endpoint in `docs/api-map.md`. When `options.pathField`
+   * names a field in `formFields` that holds a file/folder path, and the
+   * response comes back in the confirmed "path doesn't resolve" shape (see
+   * {@link isInvalidPathResponse}), transparently retries once with that
+   * field's alternate Unicode normalization (see
+   * {@link buildAlternateNormalizationParams}) — live-confirmed against
+   * `idriveent/remote/getRestoreData`: the same account's Mac-sourced device
+   * indexes paths in NFD while a typed/LLM-generated path naturally arrives
+   * as NFC, e.g. `getRestoreData` returns `{"message":"ERROR","desc":"INVALID
+   * PATH"}` for `id: "/Users/alexcresswell/vampire/José Gaspar.pdf"` (NFC)
+   * but `{"message":"SUCCESS", ...}` for the identical path `.normalize("NFD")`'d
+   * first. Omitting `options` (or `options.pathField`) leaves behavior
+   * unchanged — callers with no path field (e.g. `getListDevicesForSub`) see
+   * zero extra requests or latency.
    *
    * @param path the endpoint path, e.g. `/idriveent//remote/getListDevicesForSub`
    *   or `/idriveent/remote/getRestoreData` — always starting with `/idrive/...`
@@ -581,6 +753,9 @@ export class IdriveClient {
    * @param formFields the form fields to send as the request body; values are
    *   URL-encoded automatically (some field values are themselves JSON
    *   strings, per the API's own convention — pass them pre-stringified).
+   * @param options.pathField the key within `formFields` holding a file/folder
+   *   path to retry with its alternate normalization if the first response
+   *   looks retry-worthy, e.g. `"id"` for `getRestoreData`.
    * @returns the parsed JSON response body, or the raw text if the body
    *   isn't valid JSON.
    * @throws {SessionExpiredError} if the configured session has already
@@ -588,29 +763,37 @@ export class IdriveClient {
    * @example
    * ```ts
    * // Mirrors the confirmed getRestoreData call in docs/api-map.md
-   * const listing = await client.request("/idriveent/remote/getRestoreData", {
-   *   id: "/",
-   *   macType: "win",
-   *   selUser: "user@example.com",
-   *   from: "",
-   *   toDate: "NaN/NaN/NaN NaN:NaN:NaN",
-   *   device_id: "D01637267159000960219",
-   * });
+   * const listing = await client.request(
+   *   "/idriveent/remote/getRestoreData",
+   *   {
+   *     id: "/",
+   *     macType: "win",
+   *     selUser: "user@example.com",
+   *     from: "",
+   *     toDate: "NaN/NaN/NaN NaN:NaN:NaN",
+   *     device_id: "D01637267159000960219",
+   *   },
+   *   { pathField: "id" },
+   * );
    * ```
    */
-  async request(path: string, formFields: Record<string, string>): Promise<unknown> {
+  async request(path: string, formFields: Record<string, string>, options?: { pathField?: string }): Promise<unknown> {
     this.assertSessionValid();
 
-    const response = await fetch(`${IDRIVE_ORIGIN}${path}`, {
-      method: "POST",
-      headers: {
-        ...buildDefaultHeaders(this.cookie, `${IDRIVE_ORIGIN}/idrive/home`),
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-      },
-      body: new URLSearchParams(formFields),
-    });
+    const params = new URLSearchParams(formFields);
+    const body = await parseResponseBody(await this.postToIdrive(path, params));
 
-    return parseResponseBody(response);
+    const pathField = options?.pathField;
+    if (pathField === undefined || !isInvalidPathResponse(body)) {
+      return body;
+    }
+
+    const alternateParams = buildAlternateNormalizationParams(params, pathField);
+    if (alternateParams === null) {
+      return body;
+    }
+
+    return parseResponseBody(await this.postToIdrive(path, alternateParams));
   }
 
   /**
@@ -840,9 +1023,14 @@ export class IdriveClient {
    * satellite host — the `/evs/*` counterpart to {@link request}, used by the
    * `/idrive/home` file browser surface documented in `docs/api-map.md`'s
    * "Second app surface" section. Transparently bootstraps (and caches) the
-   * `EVSID` this host requires — see {@link getEvsid} — and retries once with
-   * a freshly-minted `EVSID` if the response comes back in the
-   * "stale/missing EVSID" shape (see {@link isInvalidEvsidResponse}).
+   * `EVSID` this host requires — see {@link getEvsid} — retries once with a
+   * freshly-minted `EVSID` if the response comes back in the "stale/missing
+   * EVSID" shape (see {@link isInvalidEvsidResponse}), and separately retries
+   * once more with the `p` field's alternate Unicode normalization (see
+   * {@link buildAlternateNormalizationParams}) if the (possibly already
+   * retried) response comes back in the "path doesn't resolve" shape (see
+   * {@link isInvalidPathResponse}) — see {@link requestEvsWithParams} for the
+   * exact sequencing.
    *
    * @param path the endpoint path, e.g. `/evs/browseFolder` — always starting
    *   with `/evs/...`.
@@ -880,6 +1068,14 @@ export class IdriveClient {
    * `evs/putBackFromTrash`'s repeatable `p` field, one per path, per
    * `docs/api-map.md`'s "Live mutation testing" section), which a
    * `Record<string, string>` can't represent since object keys are unique.
+   * Sequences its two retry axes as sibling checks on whatever the *latest*
+   * response is, not a 2×2 matrix: original request → if stale-EVSID shape,
+   * invalidate + retry with a fresh `EVSID` → if (still/now) the "path
+   * doesn't resolve" shape (see {@link isInvalidPathResponse}), retry once
+   * more with {@link EVS_PATH_FIELD}'s alternate normalization (see
+   * {@link buildAlternateNormalizationParams}), reusing the already-current
+   * `EVSID` — worst case three requests total, and the normalization retry
+   * only fires when the path actually contains decomposable characters.
    *
    * @param path the endpoint path, e.g. `/evs/v1/deleteFile`.
    * @param params the form body to send; build it with repeated
@@ -901,20 +1097,31 @@ export class IdriveClient {
    * const result = await client.requestEvsWithParams("/evs/v1/deleteFile", params);
    * // => { message: "SUCCESS", contents: [{ path: "...", result: "SUCCESS" }, ...] }
    * ```
+   * @see isInvalidPathResponse
    */
   async requestEvsWithParams(path: string, params: URLSearchParams): Promise<unknown> {
     this.assertSessionValid();
     const evsHost = this.requireEvsServerHost();
 
     const evsid = await this.getEvsid(evsHost);
-    const body = await parseResponseBody(await this.postToEvsHost(evsHost, evsid, path, params));
-    if (!isInvalidEvsidResponse(body)) {
+    let body = await parseResponseBody(await this.postToEvsHost(evsHost, evsid, path, params));
+    if (isInvalidEvsidResponse(body)) {
+      this.invalidateEvsid(evsHost);
+      const retryEvsid = await this.getEvsid(evsHost);
+      body = await parseResponseBody(await this.postToEvsHost(evsHost, retryEvsid, path, params));
+    }
+
+    if (!isInvalidPathResponse(body)) {
       return body;
     }
 
-    this.invalidateEvsid(evsHost);
-    const retryEvsid = await this.getEvsid(evsHost);
-    return parseResponseBody(await this.postToEvsHost(evsHost, retryEvsid, path, params));
+    const alternateParams = buildAlternateNormalizationParams(params, EVS_PATH_FIELD);
+    if (alternateParams === null) {
+      return body;
+    }
+
+    const normalizationEvsid = await this.getEvsid(evsHost);
+    return parseResponseBody(await this.postToEvsHost(evsHost, normalizationEvsid, path, alternateParams));
   }
 
   /**
@@ -980,14 +1187,24 @@ export class IdriveClient {
    * the byte count sidesteps that entirely, however large the file is. Same
    * `EVSID` bootstrap/caching/retry behavior as {@link requestEvs} — see
    * {@link downloadOnce} for the peek-then-stream mechanics of a single
-   * attempt.
+   * attempt. Additionally, if the post-invalidation retry's body still looks
+   * like an HTML document (see {@link looksLikeHtmlResponse}), tries once
+   * more with {@link EVS_PATH_FIELD}'s alternate Unicode normalization (see
+   * {@link buildAlternateNormalizationParams}) before giving up — an HTML
+   * fallback is the closest available failure signal for this streamed,
+   * non-JSON endpoint (unlike {@link requestEvsWithParams}'s clean
+   * `INVALID PATH` JSON shape), so this retry is speculative-but-cheap
+   * rather than a certain diagnosis.
    *
    * @param path the endpoint path, e.g. `/evs/downloadFile`.
    * @param formFields the form fields to send as the request body.
    * @param destinationPath the absolute local file path to write the
    *   downloaded content to; its parent directory is created if it doesn't
    *   already exist.
-   * @returns the number of bytes written to `destinationPath`.
+   * @returns the number of bytes written to `destinationPath`, and
+   *   `pathUsed` — the {@link EVS_PATH_FIELD} value that actually resolved
+   *   (the original `formFields.p` unless the normalization retry is what
+   *   succeeded, in which case its alternate form).
    * @throws {SessionExpiredError} if the configured session has already
    *   expired.
    * @throws {MissingEvsServerError} if the configured cookie has no
@@ -996,9 +1213,11 @@ export class IdriveClient {
    *   `EVSID` was usable.
    * @throws {EvsDownloadHttpError} if either attempt's response status
    *   wasn't 2xx, or the retry attempt (after minting a fresh `EVSID`) still
-   *   looked like the stale-EVSID error shape or looked like an HTML
+   *   looked like the stale-EVSID error shape, or looked like an HTML
    *   document (see {@link looksLikeHtmlResponse} — a confirmed EVS-host
-   *   behavior when `path` doesn't resolve to a real file/folder).
+   *   behavior when `path` doesn't resolve to a real file/folder) and either
+   *   the path had no alternate normalization to try or that attempt also
+   *   failed.
    * @throws {EvsDownloadTimeoutError} if an attempt didn't finish within the
    *   configured timeout.
    * @throws {DestinationWriteError} if writing to `destinationPath` failed
@@ -1006,45 +1225,70 @@ export class IdriveClient {
    * @example
    * ```ts
    * // Mirrors the confirmed evs/downloadFile call in docs/api-map.md
-   * const bytesWritten = await client.downloadEvsToFile(
+   * const { bytesWritten, pathUsed } = await client.downloadEvsToFile(
    *   "/evs/downloadFile",
    *   { p: "/C/AMD/Support/licensePLK.txt", json: "yes", device_id: "D01637267159000960219" },
    *   "C:\\Users\\me\\Downloads\\licensePLK.txt",
    * );
-   * // => 4096
+   * // => { bytesWritten: 4096, pathUsed: "/C/AMD/Support/licensePLK.txt" }
    * ```
    */
-  async downloadEvsToFile(path: string, formFields: Record<string, string>, destinationPath: string): Promise<number> {
+  async downloadEvsToFile(
+    path: string,
+    formFields: Record<string, string>,
+    destinationPath: string,
+  ): Promise<{ bytesWritten: number; pathUsed: string }> {
     this.assertSessionValid();
     const evsHost = this.requireEvsServerHost();
     const params = new URLSearchParams(formFields);
+    const originalPath = formFields[EVS_PATH_FIELD] ?? "";
 
     const evsid = await this.getEvsid(evsHost);
     const firstAttempt = await this.downloadOnce(evsHost, evsid, path, params, destinationPath);
     if (firstAttempt.kind === "downloaded") {
-      return firstAttempt.bytesWritten;
+      return { bytesWritten: firstAttempt.bytesWritten, pathUsed: originalPath };
     }
 
     this.invalidateEvsid(evsHost);
     const retryEvsid = await this.getEvsid(evsHost);
     const retryAttempt = await this.downloadOnce(evsHost, retryEvsid, path, params, destinationPath);
     if (retryAttempt.kind === "downloaded") {
-      return retryAttempt.bytesWritten;
+      return { bytesWritten: retryAttempt.bytesWritten, pathUsed: originalPath };
     }
 
-    throw this.buildFinalDownloadError(retryAttempt);
+    if (retryAttempt.kind !== "unexpected-html") {
+      throw this.buildFinalDownloadError(retryAttempt);
+    }
+
+    const alternateParams = buildAlternateNormalizationParams(params, EVS_PATH_FIELD);
+    if (alternateParams === null) {
+      throw this.buildFinalDownloadError(retryAttempt);
+    }
+
+    const normalizationAttempt = await this.downloadOnce(evsHost, retryEvsid, path, alternateParams, destinationPath);
+    if (normalizationAttempt.kind !== "downloaded") {
+      throw this.buildFinalDownloadError(normalizationAttempt);
+    }
+
+    return {
+      bytesWritten: normalizationAttempt.bytesWritten,
+      pathUsed: alternateParams.get(EVS_PATH_FIELD) ?? originalPath,
+    };
   }
 
   /**
    * Builds the final {@link EvsDownloadHttpError} {@link downloadEvsToFile}
-   * throws when both the first attempt and the post-invalidation retry come
-   * back as something other than `"downloaded"` — exists so the thrown
-   * message actually differs by which non-`"downloaded"` outcome the retry
-   * hit, instead of a single fixed "stale EVSID" message that would mislead
-   * a caller in the `"unexpected-html"` case (which isn't a session-staleness
-   * problem at all, see {@link looksLikeHtmlResponse}).
+   * throws once every attempt it's willing to make (the first try, the
+   * post-invalidation retry, and — only when the latter looked like an HTML
+   * fallback and the path had a usable alternate normalization — the
+   * normalization retry) has come back as something other than
+   * `"downloaded"` — exists so the thrown message actually differs by which
+   * non-`"downloaded"` outcome the last attempt hit, instead of a single
+   * fixed "stale EVSID" message that would mislead a caller in the
+   * `"unexpected-html"` case (which isn't a session-staleness problem at
+   * all, see {@link looksLikeHtmlResponse}).
    *
-   * @param retryResult the retry attempt's result, already confirmed to not
+   * @param retryResult the final attempt's result, already confirmed to not
    *   be `{ kind: "downloaded" }`.
    * @returns an {@link EvsDownloadHttpError} with a message tailored to
    *   `retryResult.kind`.

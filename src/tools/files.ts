@@ -555,7 +555,10 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
       description:
         "Lists the files and folders backed up for a given device at a given path, browsing the device's " +
         "backed-up file tree as shown in iDrive's restore console. Use the sibling `list_devices` tool to " +
-        "obtain a `deviceId`.",
+        "obtain a `deviceId`. Transparently retries with the alternate Unicode normalization (precomposed " +
+        "NFC vs. decomposed NFD) if `path` contains accented characters and the first attempt fails to " +
+        "resolve — some devices (confirmed: Mac/APFS-sourced ones) index paths in decomposed form, which " +
+        "differs from how a typed or LLM-generated path is normally encoded.",
       inputSchema: listFilesInputShape,
       annotations: {
         title: "List Files",
@@ -571,14 +574,18 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
       }
 
       try {
-        const response = await client.request(GET_RESTORE_DATA_PATH, {
-          id: path,
-          macType: osType,
-          selUser,
-          from: "",
-          toDate: UNCONFIRMED_TO_DATE_LITERAL,
-          device_id: deviceId,
-        });
+        const response = await client.request(
+          GET_RESTORE_DATA_PATH,
+          {
+            id: path,
+            macType: osType,
+            selUser,
+            from: "",
+            toDate: UNCONFIRMED_TO_DATE_LITERAL,
+            device_id: deviceId,
+          },
+          { pathField: "id" },
+        );
 
         const parsed = parseRestoreDataResponse(response);
         if (parsed === null) {
@@ -745,7 +752,11 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
         "or `list_files` first to discover the `path` of the file you want. Note: iDrive's `Content-Type` header " +
         "on this endpoint is NOT trustworthy for identifying the real file type (it's always " +
         "`text/plain;charset=UTF-8` regardless of actual content) — the downloaded data is an opaque byte " +
-        "stream; use the file's own name/extension (from a prior listing) to infer its type instead.",
+        "stream; use the file's own name/extension (from a prior listing) to infer its type instead. " +
+        "Transparently retries with the alternate Unicode normalization (precomposed NFC vs. decomposed NFD) " +
+        "if `path` contains accented characters and the first attempt fails to resolve; when that retry is " +
+        "what actually worked, the result includes a `sourcePathNormalizedTo` field showing the form that " +
+        "succeeded.",
       inputSchema: downloadFileInputShape,
       annotations: {
         title: "Download File (EVS)",
@@ -756,14 +767,22 @@ export function registerFileTools(server: McpServer, client: IdriveClient): void
     },
     async ({ deviceId, path, destinationPath }): Promise<CallToolResult> => {
       try {
-        const bytesWritten = await client.downloadEvsToFile(
+        const { bytesWritten, pathUsed } = await client.downloadEvsToFile(
           DOWNLOAD_FILE_PATH,
           { p: path, json: "yes", device_id: deviceId },
           destinationPath,
         );
 
+        const result: { path: string; bytesWritten: number; sourcePathNormalizedTo?: string } = {
+          path: destinationPath,
+          bytesWritten,
+        };
+        if (pathUsed !== path) {
+          result.sourcePathNormalizedTo = pathUsed;
+        }
+
         return {
-          content: [{ type: "text", text: JSON.stringify({ path: destinationPath, bytesWritten }) }],
+          content: [{ type: "text", text: JSON.stringify(result) }],
         };
       } catch (error) {
         if (error instanceof SessionExpiredError) {
