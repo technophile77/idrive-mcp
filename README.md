@@ -66,7 +66,9 @@ instead:
   Requires no configuration beyond `IDRIVE_COOKIE`.
 - **`list_files`** — `deviceId` (required), `path` (default `"/"`), `osType`
   (default `"win"`). Browses a device's backed-up file tree via iDrive's
-  `getRestoreData` endpoint.
+  `getRestoreData` endpoint. Transparently retries with the alternate
+  Unicode normalization (NFC vs. NFD) if `path` contains accented characters
+  and the first attempt doesn't resolve — see "Accented filenames" below.
 - **`browse_folder`** — `deviceId` (required), `path` (required, EVS format:
   `"/C"`, `"/C/Users/..."`). Browses a device's backed-up folder via the
   richer EVS-hosted `evs/browseFolder` endpoint (adds trash/checksum/live-image
@@ -87,7 +89,11 @@ instead:
   transport's message size limit, so this tool always writes to disk and
   returns `{ path, bytesWritten }` instead. iDrive's `Content-Type` on this
   endpoint is not trustworthy for identifying the real file type — infer it
-  from the file's name/extension instead.
+  from the file's name/extension instead. Transparently retries with the
+  alternate Unicode normalization (NFC vs. NFD) if `path` contains accented
+  characters and the first attempt doesn't resolve, adding a
+  `sourcePathNormalizedTo` field to the result when that retry is what
+  actually worked — see "Accented filenames" below.
 - **`get_file_properties`** — `deviceId` (required), `path` (required, same
   EVS format as `browse_folder`). Fetches size/last-modified metadata for a
   single backed-up file or folder via the EVS-hosted `evs/getProperties`
@@ -154,6 +160,20 @@ configuration is needed beyond `IDRIVE_COOKIE`, but they do require the
 cookie's `EVS_SERVER` value (present on cookies copied from `/idrive/home`,
 not necessarily on ones copied from the `idriveent` console) to know which
 EVS host to bootstrap against.
+
+### Accented filenames
+
+Some devices (confirmed: Mac/APFS-sourced ones) index backed-up paths using
+NFD (decomposed) Unicode normalization, while a typed or LLM-generated path
+normally arrives as NFC (precomposed) — the same visible character, different
+underlying code points. `list_files`, `browse_folder`, `download_file`,
+`get_file_properties`, `get_file_versions`, `create_folder`, `delete_file`,
+and `restore_from_trash` all transparently retry once with the alternate
+normalization if a path containing accented characters doesn't resolve on the
+first try, so callers don't need to know or guess which form a given device
+uses. Pure-ASCII paths (the overwhelming majority) are unaffected — no extra
+request or latency. See `docs/api-map.md`'s "Unicode normalization bug"
+section for the confirmed root cause and evidence.
 
 ## Testing
 
